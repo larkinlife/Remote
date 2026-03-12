@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# NOTE: On Nix servers, do NOT run directly. Use: /tmp/python3 /tmp/link_server.py
 """HTTP server on port 8080: tmate links + alarm mesh API."""
 import http.server
 import json

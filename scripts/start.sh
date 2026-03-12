@@ -10,20 +10,22 @@ echo "[$(date -u)] Starting services..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# === Find python3 (Nix puts it in /nix/store/) ===
+# === Find python3 (Nix puts it in /nix/store/, NOT in PATH!) ===
+# IMPORTANT: `command -v python3` on Nix returns a wrapper that triggers
+# command-not-found handler (interactive picker), NOT a real python3.
+# Always use the /nix/store/ binary directly.
 find_python() {
-    if command -v python3 &>/dev/null; then
-        echo "python3"
-        return
-    fi
-    local nix_py
-    nix_py=$(ls /nix/store/*/bin/python3 2>/dev/null | grep '3.11' | head -1)
-    if [ -n "$nix_py" ]; then
-        ln -sf "$nix_py" /tmp/python3
+    # Check if /tmp/python3 symlink already exists and works
+    if [ -x /tmp/python3 ] && /tmp/python3 -c "print('ok')" &>/dev/null; then
         echo "/tmp/python3"
         return
     fi
-    nix_py=$(ls /nix/store/*/bin/python3 2>/dev/null | head -1)
+    # Find real python3 in nix store (prefer 3.11)
+    local nix_py
+    nix_py=$(ls /nix/store/*/bin/python3 2>/dev/null | grep '3.11' | head -1)
+    if [ -z "$nix_py" ]; then
+        nix_py=$(ls /nix/store/*/bin/python3 2>/dev/null | head -1)
+    fi
     if [ -n "$nix_py" ]; then
         ln -sf "$nix_py" /tmp/python3
         echo "/tmp/python3"
@@ -126,21 +128,24 @@ start_watchdog() {
         return
     fi
 
-    cat > /tmp/alarm-watchdog.sh << WDEOF
+    cat > /tmp/alarm-watchdog.sh << 'WDEOF'
 #!/bin/bash
+# Watchdog: restart services if they die
+# ALWAYS use /tmp/python3 — never bare `python3` (Nix command-not-found trap!)
+PY=/tmp/python3
 while true; do
     sleep 60
     if ! pgrep -f "tmate -F" > /dev/null 2>&1; then
-        echo "[\$(date -u)] tmate died, restarting..." >> /tmp/watchdog.log
-        bash ${SCRIPT_DIR}/start.sh 2>/dev/null || true
+        echo "[$(date -u)] tmate died, restarting..." >> /tmp/watchdog.log
+        bash /home/user/*/scripts/start.sh 2>/dev/null || true
     fi
     if ! pgrep -f "link_server" > /dev/null 2>&1; then
-        echo "[\$(date -u)] link server died, restarting..." >> /tmp/watchdog.log
-        nohup $PYTHON /tmp/link_server.py > /tmp/link_server.log 2>&1 & disown
+        echo "[$(date -u)] link server died, restarting..." >> /tmp/watchdog.log
+        nohup $PY /tmp/link_server.py > /tmp/link_server.log 2>&1 & disown
     fi
     if ! pgrep -f "alarm_mesh" > /dev/null 2>&1; then
-        echo "[\$(date -u)] alarm mesh died, restarting..." >> /tmp/watchdog.log
-        nohup $PYTHON /tmp/alarm_mesh.py >> /tmp/alarm_mesh.log 2>&1 & disown
+        echo "[$(date -u)] alarm mesh died, restarting..." >> /tmp/watchdog.log
+        nohup $PY /tmp/alarm_mesh.py >> /tmp/alarm_mesh.log 2>&1 & disown
     fi
 done
 WDEOF

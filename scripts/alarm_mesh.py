@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# NOTE: On Nix servers, do NOT run directly. Use: /tmp/python3 /tmp/alarm_mesh.py
 """
 Alarm Mesh — Firebase Studio cross-wake system.
 
