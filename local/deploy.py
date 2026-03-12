@@ -78,7 +78,7 @@ def get_ssh_token(machine):
     return None
 
 
-def deploy_to_machine(mid, config_only=False):
+def deploy_to_machine(mid, config_only=False, manual_ssh_token=None):
     """Deploy files to a single machine via SSH."""
     if mid not in MACHINES:
         print(f"ERROR: Unknown machine '{mid}'. Known: {list(MACHINES.keys())}")
@@ -89,8 +89,8 @@ def deploy_to_machine(mid, config_only=False):
     print(f"Deploying to Machine {mid} ({machine.get('name', machine['workspace'])})")
     print(f"{'='*50}")
 
-    # Get SSH token via HTTP API
-    ssh_token = get_ssh_token(machine)
+    # Get SSH token: manual override or via HTTP API
+    ssh_token = manual_ssh_token or get_ssh_token(machine)
     if not ssh_token:
         print(f"  SKIP: Cannot get SSH token for {mid}")
         return False
@@ -123,10 +123,8 @@ def deploy_to_machine(mid, config_only=False):
     # Build deploy script
     deploy_lines = [f'#!/bin/bash', f'echo "=== Deploy to {mid} ==="']
 
-    for name, b64_data in compressed.items():
-        tmp_name = name.replace(".", "_")
-        deploy_lines.append(f'echo -n "" > /tmp/_{tmp_name}.b64')
-        # Will be sent in chunks below
+    # NOTE: .b64 files are sent as chunks BEFORE this script runs.
+    # Do NOT clear them here — they already contain the data.
 
     if not config_only:
         deploy_lines.extend([
@@ -266,12 +264,12 @@ def deploy_to_machine(mid, config_only=False):
         cmd("base64 -d /tmp/_deploy.b64 > /tmp/deploy.sh", 0.5)
 
         print("  Running deploy...")
-        cmd("bash /tmp/deploy.sh", 3)
+        cmd("bash /tmp/deploy.sh", 5)
 
-        # Wait for DEPLOY_DONE
+        # Wait for DEPLOY_DONE (give it time — python startup on Nix is slow)
         success = False
-        for _ in range(20):
-            out = read(3)
+        for _ in range(30):
+            out = read(2)
             text = clean(out)
             for line in text.split('\n'):
                 l = line.strip()
@@ -308,11 +306,28 @@ def main():
         print(f"  {sys.argv[0]} A B C D        # Deploy to specific machines")
         print(f"  {sys.argv[0]} ALL            # Deploy to all machines")
         print(f"  {sys.argv[0]} --config       # Only update machines.json on all")
+        print(f"  {sys.argv[0]} B --token SSH_TOKEN  # Deploy with manual SSH token")
         print(f"\nKnown machines: {list(MACHINES.keys())}")
         sys.exit(1)
 
     config_only = "--config" in sys.argv
-    targets = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    # Parse --token TOKEN pairs (e.g. B --token abc123 C --token def456)
+    manual_tokens = {}
+    args = sys.argv[1:]
+    i = 0
+    targets = []
+    while i < len(args):
+        if args[i] == "--token" and i + 1 < len(args):
+            # Assign token to the last target
+            if targets:
+                manual_tokens[targets[-1]] = args[i + 1]
+            i += 2
+        elif args[i].startswith("-"):
+            i += 1
+        else:
+            targets.append(args[i])
+            i += 1
 
     if "ALL" in targets:
         targets = list(MACHINES.keys())
@@ -322,7 +337,8 @@ def main():
 
     results = {}
     for mid in targets:
-        ok = deploy_to_machine(mid, config_only=config_only)
+        token = manual_tokens.get(mid)
+        ok = deploy_to_machine(mid, config_only=config_only, manual_ssh_token=token)
         results[mid] = "OK" if ok else "FAILED"
 
     print(f"\n{'='*50}")
