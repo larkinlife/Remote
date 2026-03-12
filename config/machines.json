@@ -1,0 +1,40 @@
+{
+  "machines": [
+    {
+      "id": "A",
+      "workspace": "firebase-vps123-1772983887851",
+      "web_host": "firebase-vps123-1772983887851.cluster-gjstlrnqpna56vr4xhdezmmq4e.cloudworkstations.dev",
+      "account": "felddaria8@gmail.com",
+      "project": "monospace-13",
+      "name": "vps123"
+    },
+    {
+      "id": "B",
+      "workspace": "firebase-remote-1773264110743",
+      "web_host": "firebase-remote-1773264110743.cluster-p5o54ufozbgxywgwqxykwgahws.cloudworkstations.dev",
+      "account": "andrewshipilovtest@gmail.com",
+      "project": "monospace-13",
+      "name": "remote-15582905"
+    },
+    {
+      "id": "C",
+      "workspace": "firebase-remote-1773264602398",
+      "web_host": "firebase-remote-1773264602398.cluster-zj37zwdounao2uiqvtma64veco.cloudworkstations.dev",
+      "account": "andrewshipilovtest@gmail.com",
+      "project": "monospace-13",
+      "name": "remote-95459785"
+    },
+    {
+      "id": "D",
+      "workspace": "firebase-remote-1773265271941",
+      "web_host": "firebase-remote-1773265271941.cluster-pbm4nlfnrzakyryoooaq5fq3ps.cloudworkstations.dev",
+      "account": "felddaria8@gmail.com",
+      "project": "monospace-9",
+      "name": "remote-03892936"
+    }
+  ],
+  "accounts": [
+    "felddaria8@gmail.com",
+    "andrewshipilovtest@gmail.com"
+  ]
+}
