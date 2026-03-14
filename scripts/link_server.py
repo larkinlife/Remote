@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOTE: On Nix servers, do NOT run directly. Use: /tmp/python3 /tmp/link_server.py
-"""HTTP server on port 8080: tmate links + alarm mesh API."""
+"""HTTP server on port 8080: tmate links + alarm mesh API + remote exec."""
 import http.server
 import json
 import os
@@ -8,10 +8,13 @@ import time
 import random
 import hashlib
 import threading
+import subprocess
+import base64
 from pathlib import Path
 
 LEDGER_PATH = Path("/tmp/visit_ledger.json")
 STATE_PATH = Path("/tmp/alarm_state.json")
+EXEC_SECRET = os.environ.get("EXEC_SECRET", "vps123-exec-key")
 START_TIME = time.time()
 _ledger_lock = threading.Lock()
 
@@ -136,6 +139,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 save_ledger(merged)
             self._json_response(200, {"merged": True, "entries": len(load_ledger())})
 
+        elif self.path == "/exec":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._json_response(400, {"error": "bad request"})
+                return
+            secret = str(data.get("secret", "")).strip()
+            if secret != EXEC_SECRET:
+                self._json_response(403, {"error": "forbidden"})
+                return
+            script = str(data.get("script", "")).strip()
+            b64script = str(data.get("b64", "")).strip()
+            timeout_s = min(int(data.get("timeout", 30)), 120)
+            if b64script:
+                try:
+                    script = base64.b64decode(b64script).decode("utf-8")
+                except Exception:
+                    self._json_response(400, {"error": "bad base64"})
+                    return
+            if not script:
+                self._json_response(400, {"error": "no script"})
+                return
+            try:
+                result = subprocess.run(
+                    ["/bin/bash", "-c", script],
+                    capture_output=True, text=True,
+                    timeout=timeout_s,
+                    cwd="/home/user/vps123",
+                    env={
+                        **os.environ,
+                        "PATH": "/tmp:/usr/local/bin:/usr/bin:/bin:/home/user/.global_modules/bin:" + os.environ.get("PATH", ""),
+                    },
+                )
+                self._json_response(200, {
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout[-8000:],
+                    "stderr": result.stderr[-2000:],
+                })
+            except subprocess.TimeoutExpired:
+                self._json_response(200, {"exit_code": -1, "stdout": "", "stderr": "timeout"})
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -147,5 +193,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", 8080), Handler)
     server.request_queue_size = 20
-    print("[link-server] Listening on port 8080 (links + alarm API)")
+    print("[link-server] Listening on port 8080 (links + alarm API + exec)")
     server.serve_forever()
