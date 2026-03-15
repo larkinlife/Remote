@@ -107,11 +107,20 @@ find_tmate() {
 
 start_tmate() {
     if pgrep -f "tmate.*-F" > /dev/null 2>&1; then
-        echo "[tmate] Already running."
-        if [ ! -s /tmp/tmate_links.txt ] || [ ! -s /tmp/tmate_token.txt ]; then
-            publish_tmate_links || true
+        echo "[tmate] Process found, checking health..."
+        # If links are already published and fresh, tmate is working
+        if [ -s /tmp/tmate_links.txt ] && [ -s /tmp/tmate_token.txt ]; then
+            # Check if tmate log has been written to in the last 5 minutes
+            if find /tmp/tmate.log -mmin -5 -print 2>/dev/null | grep -q .; then
+                echo "[tmate] Already running and healthy."
+                return
+            fi
         fi
-        return
+        # tmate process exists but links are missing/stale — kill and restart
+        echo "[tmate] Process exists but not healthy (stale after sleep?). Killing..."
+        pkill -f "tmate.*-F" 2>/dev/null || true
+        sleep 2
+        rm -f /tmp/tmate_links.txt /tmp/tmate_token.txt /tmp/tmate.log
     fi
 
     local TMATE_BIN
@@ -121,23 +130,13 @@ start_tmate() {
         echo "[tmate] Available in /nix/store:"
         ls /nix/store/*/bin/tmate 2>/dev/null || echo "  NONE"
         echo "[tmate] PATH: $PATH"
-        # Try nix-shell as last resort
-        if command -v nix-shell &>/dev/null; then
-            echo "[tmate] Trying nix-shell -p tmate..."
-            nix-shell -p tmate --run "tmate -f /dev/null -F" > /tmp/tmate.log 2>&1 &
-            disown
-            TMATE_BIN="nix-shell"
-        else
-            echo "[tmate] FATAL: Cannot find tmate. Services will start without SSH access."
-            return 1
-        fi
+        echo "[tmate] FATAL: Cannot find tmate. Services will start without SSH access."
+        return 1
     fi
 
-    if [ "$TMATE_BIN" != "nix-shell" ]; then
-        echo "[tmate] Starting tmate session (binary: $TMATE_BIN)..."
-        nohup "$TMATE_BIN" -f /dev/null -F > /tmp/tmate.log 2>&1 &
-        disown
-    fi
+    echo "[tmate] Starting tmate session (binary: $TMATE_BIN)..."
+    nohup "$TMATE_BIN" -f /dev/null -F > /tmp/tmate.log 2>&1 &
+    disown
 
     for _ in $(seq 1 30); do
         if publish_tmate_links; then
