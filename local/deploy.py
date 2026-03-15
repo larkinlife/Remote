@@ -107,11 +107,17 @@ def deploy_to_machine(mid, config_only=False, manual_ssh_token=None):
         # Send alarm_mesh.py and link_server.py
         alarm_path = REPO_DIR / "scripts" / "alarm_mesh.py"
         ls_path = REPO_DIR / "scripts" / "link_server.py"
+        start_path = REPO_DIR / "scripts" / "start.sh"
+        auth_path = REPO_DIR / "scripts" / "gcloud_auth_monitor.py"
 
         if alarm_path.exists():
             files_to_send["alarm_mesh.py"] = alarm_path.read_text()
         if ls_path.exists():
             files_to_send["link_server.py"] = ls_path.read_text()
+        if start_path.exists():
+            files_to_send["start.sh"] = start_path.read_text()
+        if auth_path.exists():
+            files_to_send["gcloud_auth_monitor.py"] = auth_path.read_text()
 
     # Compress each file
     compressed = {}
@@ -121,7 +127,14 @@ def deploy_to_machine(mid, config_only=False, manual_ssh_token=None):
         print(f"  {name}: {len(content)} bytes → {len(b64)} chars compressed")
 
     # Build deploy script
-    deploy_lines = [f'#!/bin/bash', f'echo "=== Deploy to {mid} ==="']
+    deploy_lines = [
+        '#!/bin/bash',
+        f'echo "=== Deploy to {mid} ==="',
+        'ROOT="$HOME/Remote"',
+        'SCRIPTS="$ROOT/scripts"',
+        'CONFIG_DIR="$ROOT/config"',
+        'mkdir -p "$SCRIPTS" "$CONFIG_DIR"',
+    ]
 
     # NOTE: .b64 files are sent as chunks BEFORE this script runs.
     # Do NOT clear them here — they already contain the data.
@@ -142,39 +155,19 @@ def deploy_to_machine(mid, config_only=False, manual_ssh_token=None):
         tmp_name = name.replace(".", "_")
         deploy_lines.append(f'base64 -d /tmp/_{tmp_name}.b64 | gzip -d > /tmp/{name}')
         deploy_lines.append(f'echo "{name}: $(wc -c < /tmp/{name}) bytes"')
+        if name == "machines.json":
+            deploy_lines.append('cp /tmp/machines.json "$CONFIG_DIR/machines.json"')
+        else:
+            deploy_lines.append(f'cp /tmp/{name} "$SCRIPTS/{name}"')
+            if name == "start.sh":
+                deploy_lines.append('chmod +x "$SCRIPTS/start.sh"')
 
     if not config_only:
         deploy_lines.extend([
             '',
-            '# Find python3 (NEVER use command -v python3 on Nix — triggers picker!)',
-            'PY=$(ls /nix/store/*/bin/python3 2>/dev/null | grep 3.11 | head -1)',
-            '[ -z "$PY" ] && PY=$(ls /nix/store/*/bin/python3 2>/dev/null | head -1)',
-            'if [ -n "$PY" ]; then ln -sf "$PY" /tmp/python3; fi',
-            'PY="/tmp/python3"',
-            '',
-            '# Start link_server',
-            'nohup $PY /tmp/link_server.py > /tmp/link_server.log 2>&1 & disown',
-            'echo "link_server PID=$!"',
-            '',
-            f'# Start alarm_mesh',
-            f'ALARM_SELF_ID={mid} nohup $PY /tmp/alarm_mesh.py >> /tmp/alarm_mesh.log 2>&1 & disown',
-            'echo "alarm_mesh PID=$!"',
-            '',
-            '# Start watchdog',
-            f'cat > /tmp/alarm-watchdog.sh << \'WDEOF\'',
-            'while true; do',
-            '    sleep 60',
-            '    PY=/tmp/python3',
-            '    if ! pgrep -f "link_server" > /dev/null 2>&1; then',
-            '        nohup $PY /tmp/link_server.py > /tmp/link_server.log 2>&1 & disown',
-            '    fi',
-            '    if ! pgrep -f "alarm_mesh" > /dev/null 2>&1; then',
-            f'        ALARM_SELF_ID={mid} nohup $PY /tmp/alarm_mesh.py >> /tmp/alarm_mesh.log 2>&1 & disown',
-            '    fi',
-            'done',
-            'WDEOF',
-            'pkill -f "alarm-watchdog" 2>/dev/null || true',
-            'nohup bash /tmp/alarm-watchdog.sh > /dev/null 2>&1 & disown',
+            'echo "Rebuilding runtime from persistent start.sh"',
+            f'printf \'{mid}\\n\' > /tmp/alarm_self_id',
+            'bash "$HOME/Remote/scripts/start.sh"',
         ])
 
     deploy_lines.extend([

@@ -94,11 +94,94 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 alarm_state = json.loads(STATE_PATH.read_text())
             except Exception:
                 alarm_state = {}
+            # Check local services health
+            local_health = {}
+            for name, port in [("code-oss", 80), ("admin-panel", 8081)]:
+                try:
+                    import socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(2)
+                    s.connect(("127.0.0.1", port))
+                    s.close()
+                    local_health[name] = "up"
+                except Exception:
+                    local_health[name] = "down"
+            # Check tmate
+            try:
+                r = subprocess.run(["pgrep", "-f", "tmate.*-F"],
+                                   capture_output=True, timeout=5)
+                local_health["tmate"] = "up" if r.returncode == 0 else "down"
+            except Exception:
+                local_health["tmate"] = "unknown"
+            # Check alarm_mesh
+            try:
+                r = subprocess.run(["pgrep", "-f", "alarm_mesh.py"],
+                                   capture_output=True, timeout=5)
+                local_health["alarm_mesh"] = "up" if r.returncode == 0 else "down"
+            except Exception:
+                local_health["alarm_mesh"] = "unknown"
             self._json_response(200, {
                 "server_uptime": int(time.time() - START_TIME),
                 "alarm_state": alarm_state,
                 "ledger_entries": len(load_ledger()),
+                "local_health": local_health,
             })
+
+        elif self.path.startswith("/logs"):
+            # /logs — returns recent alarm_mesh.log lines
+            # /logs?file=watchdog&lines=50 — specific log file
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            fname = params.get("file", ["alarm_mesh"])[0]
+            n_lines = min(int(params.get("lines", ["100"])[0]), 500)
+            allowed_logs = {
+                "alarm_mesh": "/tmp/alarm_mesh.log",
+                "watchdog": "/tmp/watchdog.log",
+                "start": "/tmp/start.log",
+                "tmate": "/tmp/tmate.log",
+                "keepalive": "/tmp/keepalive.log",
+                "link_server": "/tmp/link_server.log",
+            }
+            log_path = allowed_logs.get(fname)
+            if not log_path:
+                self._json_response(400, {"error": f"unknown log: {fname}", "available": list(allowed_logs.keys())})
+                return
+            try:
+                with open(log_path) as f:
+                    lines = f.readlines()
+                tail = lines[-n_lines:]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write("".join(tail).encode())
+            except FileNotFoundError:
+                self._json_response(404, {"error": f"log not found: {log_path}"})
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
+
+        elif self.path.startswith("/events"):
+            # /events — returns recent structured events from alarm_events.jsonl
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            n_lines = min(int(params.get("lines", ["50"])[0]), 200)
+            events_path = "/tmp/alarm_events.jsonl"
+            try:
+                with open(events_path) as f:
+                    lines = f.readlines()
+                tail = lines[-n_lines:]
+                events = []
+                for line in tail:
+                    try:
+                        events.append(json.loads(line.strip()))
+                    except Exception:
+                        pass
+                self._json_response(200, {"events": events, "total": len(lines)})
+            except FileNotFoundError:
+                self._json_response(200, {"events": [], "total": 0})
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
 
         else:
             self.send_response(404)
@@ -193,5 +276,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", 8080), Handler)
     server.request_queue_size = 20
-    print("[link-server] Listening on port 8080 (links + alarm API + exec)")
+    print("[link-server] Listening on port 8080 (links + alarm API + exec + logs)")
     server.serve_forever()

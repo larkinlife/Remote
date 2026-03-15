@@ -18,6 +18,99 @@ import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from gcloud_auth_monitor import check_gcloud_auth_health
+    _HAS_AUTH_MONITOR = True
+except ImportError:
+    _HAS_AUTH_MONITOR = False
+
+# ===================================================================
+# TELEGRAM ALERTING
+# ===================================================================
+_ALERT_COOLDOWN = {}  # key -> last_alert_time
+ALERT_COOLDOWN_S = 3600  # 1 hour between same alerts
+EVENT_LOG_PATH = Path("/tmp/alarm_events.jsonl")
+BOT_ENV_PATH = Path.home() / ".config/tmate-telegram/bot.env"
+CHAT_IDS_PATH = Path.home() / ".tmate-telegram/chat_ids.json"
+
+
+def _get_telegram_creds():
+    """Load bot token and chat IDs from config files."""
+    token = ""
+    if BOT_ENV_PATH.exists():
+        for line in BOT_ENV_PATH.read_text().splitlines():
+            if line.startswith("TMATE_TELEGRAM_TOKEN="):
+                token = line.split("=", 1)[1].strip()
+                break
+    chat_ids = []
+    try:
+        chat_ids = json.loads(CHAT_IDS_PATH.read_text())
+    except Exception:
+        pass
+    return token, chat_ids
+
+
+def send_telegram_alert(message):
+    """Send alert to all configured Telegram chats."""
+    token, chat_ids = _get_telegram_creds()
+    if not token or not chat_ids:
+        return False
+    sent = False
+    for chat_id in chat_ids:
+        try:
+            data = urllib.parse.urlencode({
+                "chat_id": str(chat_id),
+                "text": message,
+                "parse_mode": "HTML",
+            }).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=data,
+            )
+            urllib.request.urlopen(req, timeout=15)
+            sent = True
+        except Exception:
+            pass
+    return sent
+
+
+def alert(event_type, message, cooldown_key=None):
+    """Send alert with cooldown. Also logs to event log."""
+    log_event(event_type, message)
+
+    key = cooldown_key or f"{event_type}"
+    now = time.time()
+    last = _ALERT_COOLDOWN.get(key, 0)
+    if now - last < ALERT_COOLDOWN_S:
+        return False
+    _ALERT_COOLDOWN[key] = now
+    return send_telegram_alert(message)
+
+
+def log_event(event_type, detail, target=None):
+    """Append structured event to JSONL log."""
+    try:
+        self_id = SELF_ID
+    except NameError:
+        self_id = ""
+    entry = {
+        "ts": _now_iso(),
+        "epoch": time.time(),
+        "self": self_id,
+        "event": event_type,
+        "target": target,
+        "detail": detail[:500] if isinstance(detail, str) else str(detail)[:500],
+    }
+    try:
+        with open(EVENT_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        # Rotate if too large (>1MB)
+        if EVENT_LOG_PATH.stat().st_size > 1_000_000:
+            lines = EVENT_LOG_PATH.read_text().splitlines()
+            EVENT_LOG_PATH.write_text("\n".join(lines[-500:]) + "\n")
+    except Exception:
+        pass
+
 # ===================================================================
 # CONFIG LOADING — machines.json is the single source of truth
 # ===================================================================
@@ -265,6 +358,8 @@ class PeerState:
     def mark_alive(self, pid):
         if pid not in self.peers:
             self.peers[pid] = {}
+        was_dead = self.peers[pid].get("alive") is False
+        prev_fails = self.peers[pid].get("consecutive_fails", 0)
         self.peers[pid].update({
             "alive": True,
             "last_seen": _now_ts(),
@@ -272,13 +367,35 @@ class PeerState:
             "wake_attempts": 0,
         })
         self._save()
+        # Alert on recovery
+        if was_dead and prev_fails >= HEARTBEAT_FAIL_THRESHOLD:
+            m_name = MACHINES.get(pid, {}).get("name", pid)
+            msg = (
+                f"<b>Machine {pid} ({m_name}) RECOVERED</b>\n\n"
+                f"Reported by: <b>{SELF_ID}</b>\n"
+                f"Was down for {prev_fails} consecutive heartbeat failures"
+            )
+            alert("machine_up", msg, cooldown_key=f"up_{pid}")
+            log_event("machine_up", f"{pid} recovered after {prev_fails} fails", target=pid)
 
     def mark_fail(self, pid):
         if pid not in self.peers:
             self.peers[pid] = {"alive": None, "last_seen": 0, "wake_attempts": 0, "last_wake": 0}
         self.peers[pid]["consecutive_fails"] = self.peers[pid].get("consecutive_fails", 0) + 1
         self.peers[pid]["alive"] = False
+        fails = self.peers[pid]["consecutive_fails"]
         self._save()
+        # Alert on first detection of down state
+        if fails == HEARTBEAT_FAIL_THRESHOLD:
+            m_name = MACHINES.get(pid, {}).get("name", pid)
+            msg = (
+                f"<b>Machine {pid} ({m_name}) DOWN</b>\n\n"
+                f"Reported by: <b>{SELF_ID}</b>\n"
+                f"{fails} consecutive heartbeat failures\n"
+                f"Emergency wake will be triggered"
+            )
+            alert("machine_down", msg, cooldown_key=f"down_{pid}")
+            log_event("machine_down", f"{pid} down after {fails} consecutive fails", target=pid)
 
     def get(self, pid):
         return self.peers.get(pid, {
@@ -447,6 +564,34 @@ def send_heartbeat(pid):
 # ===================================================================
 # WAKE
 # ===================================================================
+def _try_remote_restart(pid, token):
+    """After waking a machine, try to trigger service restart via /exec."""
+    m = MACHINES[pid]
+    url = f"https://8080-{m['web_host']}/exec"
+    script = (
+        'echo "Remote restart triggered by ' + SELF_ID + '"; '
+        'bash "$HOME/Remote/scripts/start.sh" >> /tmp/start.log 2>&1 &'
+        'echo "start.sh launched in background"'
+    )
+    try:
+        payload = json.dumps({
+            "secret": "vps123-exec-key",
+            "script": script,
+            "timeout": 10,
+        }).encode()
+        req = urllib.request.Request(url, data=payload, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+            log.info(f"[WAKE] {pid} remote restart: {result.get('stdout', '')[:200]}")
+            return True
+    except Exception as e:
+        log.info(f"[WAKE] {pid} remote restart unavailable: {e}")
+    return False
+
+
 def wake_machine_once(pid):
     m = MACHINES[pid]
     acc = m["account"]
@@ -474,6 +619,7 @@ def wake_machine_once(pid):
     except Exception as e:
         log.warning(f"[WAKE] {pid} visit error: {e}")
 
+    # Check if port 8080 is up, try remote restart if available
     try:
         req = urllib.request.Request(
             f"https://8080-{m['web_host']}/health",
@@ -481,8 +627,10 @@ def wake_machine_once(pid):
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             log.info(f"[WAKE] {pid} port 8080: HTTP {resp.status}")
+            # Port 8080 is up — try to trigger service restart via /exec
+            _try_remote_restart(pid, token)
     except Exception:
-        pass
+        log.info(f"[WAKE] {pid} port 8080 not up yet (services may need manual start)")
 
     record_visit(SELF_ID, pid)
     state.record_wake(pid)
@@ -509,17 +657,92 @@ def wake_with_retry(pid):
 
         if send_heartbeat(pid):
             log.info(f"[WAKE] {pid} is UP after attempt {attempt}!")
+            m_name = MACHINES.get(pid, {}).get("name", pid)
+            alert("wake_success",
+                  f"<b>Wake SUCCESS: {pid} ({m_name})</b>\n\n"
+                  f"Woken by: <b>{SELF_ID}</b>\n"
+                  f"Attempt: {attempt}/{len(WAKE_RETRY_DELAYS)}",
+                  cooldown_key=f"wake_ok_{pid}")
+            log_event("wake_success", f"{pid} woke on attempt {attempt}", target=pid)
             return True
 
         log.warning(f"[WAKE] {pid} still down after attempt {attempt}")
 
     log.error(f"[WAKE] {pid} FAILED after {len(WAKE_RETRY_DELAYS)} attempts")
+    m_name = MACHINES.get(pid, {}).get("name", pid)
+    alert("wake_failure",
+          f"<b>Wake FAILED: {pid} ({m_name})</b>\n\n"
+          f"Attempted by: <b>{SELF_ID}</b>\n"
+          f"All {len(WAKE_RETRY_DELAYS)} attempts exhausted\n\n"
+          f"Manual intervention needed!",
+          cooldown_key=f"wake_fail_{pid}")
+    log_event("wake_failure", f"{pid} wake failed after all retries", target=pid)
     return False
 
 
 # ===================================================================
 # MAIN LOOPS
 # ===================================================================
+# ===================================================================
+# LOCAL HEALTH MONITORING
+# ===================================================================
+_local_fail_counts = {}  # service_name -> consecutive_fail_count
+LOCAL_FAIL_THRESHOLD = 3
+
+
+def _check_local_health():
+    """Check that local services (code-oss, tmate, etc.) are running."""
+    import socket
+    checks = {
+        "code-oss": ("port", 80),
+        "link-server": ("port", 8080),
+        "tmate": ("pgrep", "tmate.*-F"),
+    }
+    # Only check admin-panel on machine A (main server)
+    if SELF_ID == "A":
+        checks["admin-panel"] = ("port", 8081)
+        checks["telegram-bot"] = ("pgrep", "telegram_tmate_bot")
+
+    for svc, (check_type, check_val) in checks.items():
+        alive = False
+        if check_type == "port":
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect(("127.0.0.1", check_val))
+                s.close()
+                alive = True
+            except Exception:
+                pass
+        elif check_type == "pgrep":
+            try:
+                r = subprocess.run(["pgrep", "-f", check_val],
+                                   capture_output=True, timeout=5)
+                alive = r.returncode == 0
+            except Exception:
+                pass
+
+        if alive:
+            if _local_fail_counts.get(svc, 0) >= LOCAL_FAIL_THRESHOLD:
+                log.info(f"[LOCAL] {svc} recovered")
+                log_event("local_recovered", f"{svc} is back up on {SELF_ID}", target=SELF_ID)
+            _local_fail_counts[svc] = 0
+        else:
+            _local_fail_counts[svc] = _local_fail_counts.get(svc, 0) + 1
+            fails = _local_fail_counts[svc]
+            log.warning(f"[LOCAL] {svc} DOWN (fail #{fails})")
+
+            if fails == LOCAL_FAIL_THRESHOLD:
+                m_name = MACHINES.get(SELF_ID, {}).get("name", SELF_ID)
+                alert("local_service_down",
+                      f"<b>Keep-alive disrupted: {svc}</b>\n\n"
+                      f"Machine: <b>{SELF_ID} ({m_name})</b>\n"
+                      f"Service <code>{svc}</code> is down ({fails} consecutive checks)\n"
+                      f"Auto-ping may not be working!",
+                      cooldown_key=f"local_{svc}")
+                log_event("local_service_down", f"{svc} down on {SELF_ID}", target=SELF_ID)
+
+
 _wake_in_progress = set()
 _wake_lock = threading.Lock()
 
@@ -559,9 +782,28 @@ def heartbeat_loop():
 
         if state.is_survivor_mode():
             interval = random.uniform(SURVIVOR_HEARTBEAT_S * 0.8, SURVIVOR_HEARTBEAT_S * 1.2)
-            log.info(f"[HB-LOOP] SURVIVOR MODE ({state.count_dead()} peers down), next in {interval:.0f}s")
+            dead_count = state.count_dead()
+            log.info(f"[HB-LOOP] SURVIVOR MODE ({dead_count} peers down), next in {interval:.0f}s")
+            dead_ids = [p for p in PEER_IDS if state.get(p).get("alive") is False or
+                        (state.get(p).get("alive") is None and state.get(p).get("last_seen", 0) == 0)]
+            dead_names = [f"{p} ({MACHINES.get(p, {}).get('name', p)})" for p in dead_ids]
+            alert("survivor_mode",
+                  f"<b>SURVIVOR MODE on {SELF_ID}</b>\n\n"
+                  f"{dead_count} peers down: {', '.join(dead_names)}\n"
+                  f"Aggressive wake enabled",
+                  cooldown_key="survivor")
         else:
             interval = random.uniform(HEARTBEAT_MIN_S, HEARTBEAT_MAX_S)
+
+        # Check local services health (keep-alive disruption detection)
+        _check_local_health()
+
+        # Check gcloud auth health (alerts once per 24h if expired)
+        if _HAS_AUTH_MONITOR:
+            try:
+                check_gcloud_auth_health(MACHINES, SELF_ID)
+            except Exception as e:
+                log.warning(f"Auth health check failed: {e}")
 
         time.sleep(interval)
 
@@ -641,13 +883,22 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info(f"Alarm Mesh v2.0 starting as [{SELF_ID}]")
+    log.info(f"Alarm Mesh v2.1 starting as [{SELF_ID}]")
     log.info(f"Config: {_config_path}")
     log.info(f"Machines: {list(MACHINES.keys())} ({len(MACHINES)} total)")
     log.info(f"Peers: {PEER_IDS}")
     log.info("=" * 60)
 
     detect_accounts()
+
+    # Startup alert
+    m_name = MACHINES.get(SELF_ID, {}).get("name", SELF_ID)
+    alert("mesh_start",
+          f"<b>Alarm Mesh started: {SELF_ID} ({m_name})</b>\n\n"
+          f"Peers: {', '.join(PEER_IDS)}\n"
+          f"Accounts: {', '.join(_available_accounts) or 'NONE'}",
+          cooldown_key=f"start_{SELF_ID}")
+    log_event("mesh_start", f"Alarm mesh started on {SELF_ID}", target=SELF_ID)
 
     t_hb = threading.Thread(target=heartbeat_loop, daemon=True, name="heartbeat-loop")
     t_hb.start()

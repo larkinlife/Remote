@@ -115,15 +115,95 @@ cmd_status() {
     done
 }
 
+cmd_logs() {
+    local mid="$1"
+    local logfile="${2:-alarm_mesh}"
+    local lines="${3:-100}"
+    local web_host=$(get_field "$mid" "web_host")
+    local account=$(get_field "$mid" "account")
+    local name=$(get_field "$mid" "name // .workspace")
+
+    if [ "$web_host" = "null" ] || [ -z "$web_host" ]; then
+        echo "ERROR: Unknown machine '$mid'. Use: $0 list"
+        exit 1
+    fi
+
+    local token=$(get_token "$account")
+    if [ -z "$token" ]; then
+        echo "ERROR: No gcloud token for $account"
+        return 1
+    fi
+
+    echo "=== $mid ($name) — $logfile log (last $lines lines) ==="
+    curl -sf -m 15 -H "Authorization: Bearer $token" \
+        "https://8080-${web_host}/logs?file=${logfile}&lines=${lines}" 2>/dev/null || echo "Failed to get logs (endpoint not deployed or machine down)"
+    echo ""
+}
+
+cmd_events() {
+    local mid="$1"
+    local lines="${2:-50}"
+    local web_host=$(get_field "$mid" "web_host")
+    local account=$(get_field "$mid" "account")
+    local name=$(get_field "$mid" "name // .workspace")
+
+    if [ "$web_host" = "null" ] || [ -z "$web_host" ]; then
+        echo "ERROR: Unknown machine '$mid'. Use: $0 list"
+        exit 1
+    fi
+
+    local token=$(get_token "$account")
+    if [ -z "$token" ]; then
+        echo "ERROR: No gcloud token for $account"
+        return 1
+    fi
+
+    echo "=== $mid ($name) — events (last $lines) ==="
+    curl -sf -m 15 -H "Authorization: Bearer $token" \
+        "https://8080-${web_host}/events?lines=${lines}" 2>/dev/null | jq '.events[] | "\(.ts) [\(.event)] \(.detail)"' -r 2>/dev/null || echo "Failed to get events"
+    echo ""
+}
+
+cmd_logs_all() {
+    local logfile="${1:-alarm_mesh}"
+    local lines="${2:-30}"
+    for mid in $(get_machine_ids); do
+        cmd_logs "$mid" "$logfile" "$lines"
+    done
+}
+
+cmd_events_all() {
+    local lines="${1:-30}"
+    for mid in $(get_machine_ids); do
+        cmd_events "$mid" "$lines"
+    done
+}
+
 case "${1:-help}" in
     status)  cmd_status ;;
     list)    cmd_list ;;
     ssh)     cmd_connect "${2:?Usage: $0 ssh <ID>}" ;;
+    logs)
+        if [ "${2:-all}" = "all" ]; then
+            cmd_logs_all "${3:-alarm_mesh}" "${4:-30}"
+        else
+            cmd_logs "${2}" "${3:-alarm_mesh}" "${4:-100}"
+        fi
+        ;;
+    events)
+        if [ "${2:-all}" = "all" ]; then
+            cmd_events_all "${3:-30}"
+        else
+            cmd_events "${2}" "${3:-50}"
+        fi
+        ;;
     help|--help|-h)
         echo "Usage:"
-        echo "  $0 <ID>     - Connect to machine via SSH"
-        echo "  $0 status   - Check all machines"
-        echo "  $0 list     - List all configured machines"
+        echo "  $0 <ID>          - Connect to machine via SSH"
+        echo "  $0 status        - Check all machines"
+        echo "  $0 list          - List all configured machines"
+        echo "  $0 logs <ID|all> [file] [lines]  - View logs (alarm_mesh|watchdog|start|tmate|keepalive)"
+        echo "  $0 events <ID|all> [lines]       - View structured events"
         ;;
     *)
         # Try as machine ID
@@ -131,7 +211,7 @@ case "${1:-help}" in
             cmd_connect "$1"
         else
             echo "Unknown command or machine: $1"
-            echo "Use: $0 list  to see available machines"
+            echo "Use: $0 help  for all commands"
             exit 1
         fi
         ;;
