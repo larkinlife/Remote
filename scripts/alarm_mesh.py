@@ -198,11 +198,15 @@ PEER_IDS = [pid for pid in MACHINES if pid != SELF_ID]
 # ===================================================================
 # LOGGING
 # ===================================================================
+LOG_MAX_BYTES = 2_000_000   # 2MB per log file
+LOG_BACKUP_COUNT = 1        # keep 1 backup (.log.1)
+
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_PATH),
+        RotatingFileHandler(LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT),
         logging.StreamHandler(),
     ],
 )

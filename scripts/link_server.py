@@ -245,11 +245,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json_response(400, {"error": "no script"})
                 return
             try:
+                exec_cwd = "/home/user/vps123" if os.path.isdir("/home/user/vps123") else os.path.expanduser("~")
                 result = subprocess.run(
                     ["/bin/bash", "-c", script],
                     capture_output=True, text=True,
                     timeout=timeout_s,
-                    cwd="/home/user/vps123",
+                    cwd=exec_cwd,
                     env={
                         **os.environ,
                         "PATH": "/tmp:/usr/local/bin:/usr/bin:/bin:/home/user/.global_modules/bin:" + os.environ.get("PATH", ""),
